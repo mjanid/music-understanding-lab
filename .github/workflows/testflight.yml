@@ -1,0 +1,173 @@
+name: TestFlight
+
+# Builds Apple's "Music Understanding Lab" sample (WWDC26 session 253) with Xcode 27
+# on a GitHub-hosted Apple silicon runner and uploads it to TestFlight (internal only).
+
+on:
+  workflow_dispatch:
+    inputs:
+      signing:
+        description: "Signing strategy (switch only if export fails)"
+        type: choice
+        options: [unsigned-archive, signed-archive]
+        default: unsigned-archive
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/**"
+      - "scripts/**"
+
+concurrency:
+  group: testflight
+  cancel-in-progress: false
+
+env:
+  SAMPLE_URL: https://docs-assets.developer.apple.com/published/61ca887a1d2e/CreatingVisualsWithMusicUnderstandingAnalysisResults.zip
+  SAMPLE_SHA256: b8407ad1dc367f0212fff4ac3eff6765723b810f39fb34b1e6d1428c203ce280
+  PROJECT: sample/MusicUnderstandingLab/MusicUnderstandingLab.xcodeproj
+  SCHEME: MusicUnderstandingLab
+  BUNDLE_ID: com.mjanid.musicunderstandinglab
+  SIGNING: ${{ inputs.signing || 'unsigned-archive' }}
+
+jobs:
+  testflight:
+    runs-on: xcode-27
+    timeout-minutes: 45
+    env:
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check secrets
+        run: |
+          missing=()
+          for v in ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_P8 APPLE_TEAM_ID; do
+            [ -n "${!v}" ] || missing+=("$v")
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Missing repository secrets: ${missing[*]} (run scripts/set-secrets.sh on your Mac)"
+            exit 1
+          fi
+
+      - name: Toolchain
+        run: |
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i iphoneos
+
+      - name: Write API key
+        run: |
+          mkdir -p "$RUNNER_TEMP/keys"
+          printf '%s\n' "$ASC_KEY_P8" > "$RUNNER_TEMP/keys/AuthKey_${ASC_KEY_ID}.p8"
+          chmod 600 "$RUNNER_TEMP/keys/AuthKey_${ASC_KEY_ID}.p8"
+          echo "ASC_KEY_PATH=$RUNNER_TEMP/keys/AuthKey_${ASC_KEY_ID}.p8" >> "$GITHUB_ENV"
+
+      - name: App Store Connect preflight (bundle ID + app record)
+        id: asc
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet pyjwt cryptography
+          "$RUNNER_TEMP/venv/bin/python" -I scripts/asc_preflight.py
+
+      - name: Download Apple sample
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/sample.zip" "$SAMPLE_URL"
+          echo "$SAMPLE_SHA256  $RUNNER_TEMP/sample.zip" | shasum -a 256 -c -
+          mkdir -p sample
+          unzip -q "$RUNNER_TEMP/sample.zip" -d sample
+          ls sample
+
+      - name: Archive (iOS, Release)
+        run: |
+          set -o pipefail
+          BUILD_NUMBER="${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
+          echo "BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
+          if [ "$SIGNING" = "signed-archive" ]; then
+            SIGN_ARGS=(CODE_SIGN_STYLE=Automatic -allowProvisioningUpdates
+              -authenticationKeyPath "$ASC_KEY_PATH"
+              -authenticationKeyID "$ASC_KEY_ID"
+              -authenticationKeyIssuerID "$ASC_ISSUER_ID")
+          else
+            SIGN_ARGS=(CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=)
+          fi
+          xcodebuild archive \
+            -project "$PROJECT" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/MUL.xcarchive" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            MARKETING_VERSION=1.0 \
+            TARGETED_DEVICE_FAMILY=1,2 \
+            CODE_SIGN_ENTITLEMENTS= \
+            INFOPLIST_KEY_ITSAppUsesNonExemptEncryption=NO \
+            "${SIGN_ARGS[@]}" 2>&1 | tee "$RUNNER_TEMP/archive.log" | grep -E "error:|warning: .*(sign|provision)|ARCHIVE (SUCCEEDED|FAILED)" || true
+          test -d "$RUNNER_TEMP/MUL.xcarchive/Products/Applications"
+
+      - name: Export + upload to TestFlight
+        run: |
+          set -o pipefail
+          if [ "${{ steps.asc.outputs.app_exists }}" = "true" ]; then DEST=upload; else DEST=export; fi
+          echo "Export destination: $DEST"
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>${DEST}</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>teamID</key><string>${APPLE_TEAM_ID}</string>
+            <key>testFlightInternalTestingOnly</key><true/>
+            <key>uploadSymbols</key><true/>
+            <key>manageAppVersionAndBuildNumber</key><false/>
+          </dict>
+          </plist>
+          EOF
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/MUL.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$ASC_KEY_PATH" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" 2>&1 | tee "$RUNNER_TEMP/export.log"
+          echo "DEST=$DEST" >> "$GITHUB_ENV"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Music Understanding Lab"
+            echo "- Bundle ID: \`$BUNDLE_ID\`"
+            echo "- Build: 1.0 (${BUILD_NUMBER:-n/a}), signing: $SIGNING"
+            if [ "${{ steps.asc.outputs.app_exists }}" = "true" ]; then
+              echo "- Uploaded to App Store Connect. After processing (~5-15 min) it appears in TestFlight for internal testers."
+            else
+              echo "- **No App Store Connect app record yet.** Create one (New App, iOS, bundle ID \`$BUNDLE_ID\`), then re-run this workflow."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail if app record is missing
+        if: steps.asc.outputs.app_exists != 'true'
+        run: |
+          echo "::error::Build and signing worked, but there is no App Store Connect app for $BUNDLE_ID yet. Create it, then re-run."
+          exit 1
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-logs
+          path: |
+            ${{ runner.temp }}/*.log
+            ${{ runner.temp }}/export/*.log
+          if-no-files-found: ignore
+
+      - name: Remove API key
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/keys"
