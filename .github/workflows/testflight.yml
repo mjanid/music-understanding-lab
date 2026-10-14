@@ -79,6 +79,15 @@ jobs:
           unzip -q "$RUNNER_TEMP/sample.zip" -d sample
           ls sample
 
+      - name: Flatten app icon (App Store rejects alpha channel)
+        run: |
+          ICON_DIR=sample/MusicUnderstandingLab/MusicUnderstandingLab/Assets.xcassets/AppIcon.appiconset
+          for f in "$ICON_DIR"/*.png; do
+            sips -s format jpeg "$f" --out "$RUNNER_TEMP/icon.jpg" >/dev/null
+            sips -s format png "$RUNNER_TEMP/icon.jpg" --out "$f" >/dev/null
+          done
+          sips -g hasAlpha "$ICON_DIR/Icon-iOS-1024x1024.png"
+
       - name: Archive (iOS, Release)
         run: |
           set -o pipefail
