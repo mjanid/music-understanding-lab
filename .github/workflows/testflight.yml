@@ -167,6 +167,7 @@ jobs:
             ${{ runner.temp }}/*.log
             ${{ runner.temp }}/export/*.log
           if-no-files-found: ignore
+          retention-days: 3
 
       - name: Remove API key
         if: always()
